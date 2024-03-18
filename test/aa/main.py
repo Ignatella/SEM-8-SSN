@@ -1,4 +1,3 @@
-import numpy as np
 import os
 import tempfile
 import torch
@@ -9,51 +8,58 @@ from filelock import FileLock
 from torch.utils.data import random_split
 import torchvision
 import torchvision.transforms as transforms
-from typing import Dict
 import ray
 from ray import train, tune
 from ray.train import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
-from ray.air import session
-from ray.train import RunConfig, ScalingConfig
-from ray.autoscaler.sdk import request_resources
+from torchmetrics import classification as metrics
 
 
 class Net(nn.Module):
-    def __init__(self, l1=120, l2=84):
+    def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, l1)
-        self.fc2 = nn.Linear(l1, l2)
-        self.fc3 = nn.Linear(l2, 10)
+
+        self.conv_block1 = nn.Sequential(
+            nn.Conv2d(1, 6, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv2d(6, 16, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.fc1 = nn.Linear(16 * 4 * 4, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = x.view(-1, 16 * 4 * 4)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
+        x = F.log_softmax(x, dim=1)
         return x
 
 
 def load_data(data_dir="./data"):
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.5), (0.5))
     ])
 
     # We add FileLock here because multiple workers will want to
     # download data, and this may cause overwrites since
     # DataLoader is not threadsafe.
     with FileLock(os.path.expanduser("~/.data.lock")):
-        trainset = torchvision.datasets.CIFAR10(
+        trainset = torchvision.datasets.MNIST(
             root=data_dir, train=True, download=True, transform=transform)
 
-        testset = torchvision.datasets.CIFAR10(
+        testset = torchvision.datasets.MNIST(
             root=data_dir, train=False, download=True, transform=transform)
 
     return trainset, testset
@@ -62,16 +68,36 @@ def load_data(data_dir="./data"):
 def load_test_data():
     # Load fake data for running a quick smoke-test.
     trainset = torchvision.datasets.FakeData(
-        128, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+        128, (1, 28, 28), num_classes=10, transform=transforms.ToTensor()
     )
     testset = torchvision.datasets.FakeData(
-        16, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+        16, (1, 28, 28), num_classes=10, transform=transforms.ToTensor()
     )
     return trainset, testset
 
 
+def get_criterion(config):
+    if config["loss_function"] == "nnloss":
+        return nn.NLLLoss()
+    else:
+        return nn.CrossEntropyLoss()
+
+
+def get_optimizer(config, net):
+    if config["optimizer"]["name"] == "adam":
+        return optim.Adam(net.parameters(), lr=config["learning_rate"])
+    elif config["optimizer"]["name"] == "sgd":
+        return optim.SGD(
+            net.parameters(),
+            lr=config["learning_rate"],
+            momentum=config["optimizer"]["momentum"],
+        )
+    elif config["optimizer"]["name"] == "rmsprop":
+        return optim.RMSprop(net.parameters(), lr=config["learning_rate"])
+
+
 def train_cifar(config):
-    net = Net(config["l1"], config["l2"])
+    net = Net()
 
     device = "cpu"
     if torch.cuda.is_available():
@@ -80,8 +106,8 @@ def train_cifar(config):
             net = nn.DataParallel(net)
     net.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(net.parameters(), lr=config["lr"], momentum=0.9)
+    criterion = get_criterion(config)
+    optimizer = get_optimizer(config, net)
 
     # Load existing checkpoint through `get_checkpoint()` API.
     if train.get_checkpoint():
@@ -106,18 +132,21 @@ def train_cifar(config):
         train_subset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
-        num_workers=0 if config["smoke_test"] else 8,
+        num_workers=0 if config["smoke_test"] else 2,
     )
     valloader = torch.utils.data.DataLoader(
         val_subset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
-        num_workers=0 if config["smoke_test"] else 8,
+        num_workers=0 if config["smoke_test"] else 2,
     )
 
     for epoch in range(10):  # loop over the dataset multiple times
-        running_loss = 0.0
+        net.train()
+
         epoch_steps = 0
+        running_loss = 0.0
+
         for i, data in enumerate(trainloader):
             # get the inputs; data is a list of [inputs, labels]
             inputs, labels = data
@@ -145,8 +174,12 @@ def train_cifar(config):
         val_steps = 0
         total = 0
         correct = 0
+        f1 = metrics.MulticlassF1Score(
+            num_classes=10, average='macro')
         for i, data in enumerate(valloader, 0):
             with torch.no_grad():
+                net.eval()
+
                 inputs, labels = data
                 inputs, labels = inputs.to(device), labels.to(device)
 
@@ -157,6 +190,7 @@ def train_cifar(config):
 
                 loss = criterion(outputs, labels)
                 val_loss += loss.cpu().numpy()
+                f1.update(outputs, labels)
                 val_steps += 1
 
         # Here we save a checkpoint. It is automatically registered with
@@ -171,15 +205,19 @@ def train_cifar(config):
             )
             checkpoint = Checkpoint.from_directory(temp_checkpoint_dir)
             train.report(
-                {"loss": (val_loss / val_steps), "accuracy": correct / total},
+                {
+                    "val_loss": (val_loss / val_steps),
+                    "val_accuracy": correct / total,
+                    "val_f1": f1.compute().item(),
+                },
                 checkpoint=checkpoint,
             )
+
     print("Finished Training")
 
 
 def test_best_model(best_result, smoke_test=False):
-    best_trained_model = Net(
-        best_result.config["l1"], best_result.config["l2"])
+    best_trained_model = Net()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     best_trained_model.to(device)
 
@@ -200,7 +238,10 @@ def test_best_model(best_result, smoke_test=False):
 
     correct = 0
     total = 0
+    f1 = metrics.MulticlassF1Score(num_classes=10, average='macro')
     with torch.no_grad():
+        best_trained_model.eval()
+
         for data in testloader:
             images, labels = data
             images, labels = images.to(device), labels.to(device)
@@ -209,20 +250,30 @@ def test_best_model(best_result, smoke_test=False):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-    print("Best trial test set accuracy: {}".format(correct / total))
+            f1.update(outputs, labels)
 
-# function to perform the tuning using tune-search library
-# add function decorator
+    print("Best trial test set accuracy: {}".format(correct / total))
+    print("Best trial test set f1: {}".format(f1.compute().item()))
 
 
 def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2, smoke_test=False):
     config = {
-        "l1": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
-        "l2": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
-        "lr": tune.loguniform(1e-4, 1e-1),
-        "batch_size": tune.choice([2, 4, 8, 16]),
+        "optimizer": tune.choice(
+            [
+                {'name': 'adam'},
+                {
+                    'name': 'sgd',
+                    'momentum': tune.choice([0, 0.9])
+                },
+                {'name': 'rmsprop'}
+            ]
+        ),
+        "loss_function": tune.choice(['nnloss', 'crossentropy']),
+        "batch_size": tune.choice([2, 4, 8, 16, 32, 64, 128, 512, 1024]),
+        "learning_rate": tune.loguniform(1e-4, 1e-1),
         "smoke_test": smoke_test,
     }
+
     scheduler = ASHAScheduler(
         max_t=max_num_epochs,
         grace_period=1,
@@ -231,10 +282,10 @@ def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2, smoke_test=False):
     tuner = tune.Tuner(
         tune.with_resources(
             tune.with_parameters(train_cifar),
-            resources={"cpu": 2, "gpu": gpus_per_trial}
+            resources={"cpu": 1, "gpu": gpus_per_trial}
         ),
         tune_config=tune.TuneConfig(
-            metric="loss",
+            metric="val_loss",
             mode="min",
             scheduler=scheduler,
             num_samples=num_samples,
@@ -243,22 +294,24 @@ def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2, smoke_test=False):
         param_space=config,
         run_config=train.RunConfig(
             storage_path="s3://ignatella-ray/",
-            name="experiment_name",
+            name="mnist2",
         )
     )
+
     results = tuner.fit()
 
-    best_result = results.get_best_result("loss", "min")
+    print("Getting best result")
+
+    best_result = results.get_best_result("val_loss", "min")
 
     print("Best trial config: {}".format(best_result.config))
     print("Best trial final validation loss: {}".format(
-        best_result.metrics["loss"]))
+        best_result.metrics["val_loss"]))
     print("Best trial final validation accuracy: {}".format(
-        best_result.metrics["accuracy"]))
+        best_result.metrics["val_accuracy"]))
 
-    test_best_model(best_result, smoke_test=smoke_test)
+    test_best_model(best_result, smoke_test)
 
 
 ray.init()
-main(num_samples=50, max_num_epochs=10,
-     gpus_per_trial=0, smoke_test=False)
+main(num_samples=200, max_num_epochs=10, gpus_per_trial=0, smoke_test=False)
