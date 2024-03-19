@@ -17,8 +17,6 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.air import session
 from ray.train import RunConfig, ScalingConfig
 from ray.autoscaler.sdk import request_resources
-# Define a simple neural network model
-from ray.tune import CLIReporter
 
 
 class Net(nn.Module):
@@ -41,7 +39,38 @@ class Net(nn.Module):
         return x
 
 
-def train(config):
+def load_data(data_dir="./data"):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
+
+    # We add FileLock here because multiple workers will want to
+    # download data, and this may cause overwrites since
+    # DataLoader is not threadsafe.
+    with FileLock(os.path.expanduser("~/.data.lock")):
+        trainset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=True, download=True, transform=transform)
+
+        testset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=False, download=True, transform=transform)
+
+    return trainset, testset
+
+
+def load_test_data():
+    # Load fake data for running a quick smoke-test.
+    trainset = torchvision.datasets.FakeData(
+        128, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+    )
+    testset = torchvision.datasets.FakeData(
+        16, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+    )
+    return trainset, testset
+
+
+def train_cifar(config):
     net = Net(config["l1"], config["l2"])
 
     device = "cpu"
@@ -147,73 +176,89 @@ def train(config):
             )
     print("Finished Training")
 
-# Define a function to train the model
+
+def test_best_model(best_result, smoke_test=False):
+    best_trained_model = Net(
+        best_result.config["l1"], best_result.config["l2"])
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    best_trained_model.to(device)
+
+    checkpoint_path = os.path.join(
+        best_result.checkpoint.to_directory(), "checkpoint.pt")
+
+    model_state, optimizer_state = torch.load(checkpoint_path)
+    best_trained_model.load_state_dict(model_state)
+
+    if smoke_test:
+        _, testset = load_test_data()
+    else:
+        _, testset = load_data()
+
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=4, shuffle=False, num_workers=2
+    )
+
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data in testloader:
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = best_trained_model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    print("Best trial test set accuracy: {}".format(correct / total))
+
+# function to perform the tuning using tune-search library
+# add function decorator
 
 
-def train(config):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2, smoke_test=False):
+    config = {
+        "l1": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
+        "l2": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
+        "lr": tune.loguniform(1e-4, 1e-1),
+        "batch_size": tune.choice([2, 4, 8, 16]),
+        "smoke_test": smoke_test,
+    }
+    scheduler = ASHAScheduler(
+        max_t=max_num_epochs,
+        grace_period=1,
+        reduction_factor=2)
 
-    # Define model, loss function, and optimizer
-    model = Net(input_size, config["hidden_size"], output_size).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    tuner = tune.Tuner(
+        tune.with_resources(
+            tune.with_parameters(train_cifar),
+            resources={"cpu": 2, "gpu": gpus_per_trial}
+        ),
+        tune_config=tune.TuneConfig(
+            metric="loss",
+            mode="min",
+            scheduler=scheduler,
+            num_samples=num_samples,
+            max_concurrent_trials=num_samples,
+        ),
+        param_space=config,
+        run_config=train.RunConfig(
+            storage_path="s3://ignatella-ray/",
+            name="experiment_name",
+        )
+    )
+    results = tuner.fit()
 
-    # Training loop
-    for epoch in range(num_epochs):
-        # Train the model
-        # ...
+    best_result = results.get_best_result("loss", "min")
 
-        # Compute metrics
-        # ...
+    print("Best trial config: {}".format(best_result.config))
+    print("Best trial final validation loss: {}".format(
+        best_result.metrics["loss"]))
+    print("Best trial final validation accuracy: {}".format(
+        best_result.metrics["accuracy"]))
 
-        # Report metrics to Tune
-        train.report({"accuracy": 1, "loss": 2})
-        # Note: Replace accuracy and loss with your actual metrics
-
-        # Checkpoint model at the end of each epoch
-        if epoch == num_epochs - 1:
-            with tune.checkpoint_dir(epoch) as checkpoint_dir:
-                path = f"{checkpoint_dir}/checkpoint"
-                torch.save((model.state_dict(), optimizer.state_dict()), path)
-            train.report({"accuracy": 1, "loss": 2})
+    test_best_model(best_result, smoke_test=smoke_test)
 
 
-# Define search space
-search_space = {
-    "lr": tune.loguniform(1e-4, 1e-1),
-    "hidden_size": tune.choice([64, 128, 256])
-}
-
-# Define training configuration
-num_epochs = 10
-input_size = 784  # Example input size for MNIST
-output_size = 10  # Example output size for MNIST
-
-# Initialize Ray
 ray.init()
-
-# Configure Tune
-scheduler = ASHAScheduler(max_t=num_epochs, grace_period=1)
-
-# Start hyperparameter tuning with autoscaling
-analysis = tune.run(
-    train,
-    config=search_space,
-    resources_per_trial={"cpu": 4},  # Number of CPUs per trial
-    num_samples=10,  # Number of hyperparameter samples to try
-    scheduler=scheduler,
-)
-
-# Get the best hyperparameters
-best_trial = analysis.get_best_trial(metric="mean_accuracy", mode="max")
-print("Best hyperparameters found:", best_trial.config)
-
-# Retrieve the best model
-best_model = Net(
-    input_size, best_trial.config["hidden_size"], output_size)
-best_checkpoint_dir = best_trial.checkpoint.value
-best_model_state_dict, _ = torch.load(best_checkpoint_dir)
-best_model.load_state_dict(best_model_state_dict)
-best_model.eval()
-
-# You can now use the best_model for inference or further training
+main(num_samples=50, max_num_epochs=10,
+     gpus_per_trial=0, smoke_test=False)
